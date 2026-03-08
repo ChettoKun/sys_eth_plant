@@ -2,149 +2,103 @@ import streamlit as st
 import biosteam as bst
 import thermosteam as tmo
 import pandas as pd
-import os
 import google.generativeai as genai
+from PIL import Image
+import os
 
-# ==========================================
-# 1. CONFIGURACIÓN DE LA PÁGINA
-# ==========================================
-st.set_page_config(
-    page_title="Simulador BioSTEAM - Calentamiento de Mosto", 
-    layout="wide"
-)
+# =================================================================
+# 1. CONFIGURACIÓN DE IA (GEMINI)
+# =================================================================
+if "GEMINI_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"]) 
+    model = genai.GenerativeModel('gemini-2.5-pro')
+else:
+    st.warning("⚠️ No se encontró la GEMINI_API_KEY en los Secrets de Streamlit.")
 
-# ==========================================
+# =================================================================
 # 2. LÓGICA DE SIMULACIÓN (ENCAPSULADA)
-# ==========================================
-def ejecutar_simulacion(flujo_mosto, temp_mosto, temp_salida_w210):
+# =================================================================
+def ejecutar_simulacion(flujo_total, pct_etanol, p_flash_kpa, t_mosto_c):
     """
-    Encapsula la simulación de BioSTEAM. 
-    Limpia el entorno antes de cada corrida para evitar IDs duplicados.
+    Encapsula la lógica de BioSTEAM. 
+    Usa bst.main_flowsheet.clear() para evitar errores de IDs duplicados.
     """
-    # Limpieza obligatoria del flowsheet
-    bst.main_flowsheet.clear()
+    bst.main_flowsheet.clear() 
     
     # Configuración Termodinámica
     chemicals = tmo.Chemicals(["Water", "Ethanol"])
     bst.settings.set_thermo(chemicals)
-    
-    # Definición de Corrientes dinámicas
+
+    # Definición de Corrientes con parámetros dinámicos
+    # Convertimos % másico a flujos individuales
+    f_etanol = flujo_total * (pct_etanol / 100)
+    f_agua = flujo_total - f_etanol
+
     mosto = bst.Stream("1-MOSTO",
-                       Water=flujo_mosto * 0.9, 
-                       Ethanol=flujo_mosto * 0.1, 
-                       units="kg/hr",
-                       T=temp_mosto + 273.15,
-                       P=101325)
-                       
+                      Water=f_agua, Ethanol=f_etanol, units="kg/hr",
+                      T=t_mosto_c + 273.15, P=101325)
+
     vinazas_retorno = bst.Stream("Vinazas-Retorno",
-                                 Water=200, Ethanol=0, units="kg/hr",
-                                 T=95 + 273.15, P=300000)
-                                 
-    # Selección de Equipos
-    P100 = bst.Pump("P-100", ins=mosto, P=4*101325)
-    
-    W210 = bst.HXprocess("W-210",
-                         ins=(P100-0, vinazas_retorno),
-                         outs=("3-Mosto-Pre", "Drenaje"),
-                         phase0="l", phase1="l")
-                         
-    # Especificación de diseño (Goal)
-    W210.outs[0].T = temp_salida_w210 + 273.15
-    
-    # Crear y resolver el sistema
-    sys = bst.System("sys", path=(P100, W210))
-    sys.simulate()
-    
-    return sys, P100, W210
+                                Water=200, Ethanol=0, units="kg/hr",
+                                T=95 + 273.15, P=300000)
 
-# ==========================================
-# 3. INTERFAZ DE USUARIO (UI)
-# ==========================================
-st.title("⚙️ Simulación de Calentamiento de Mosto con Vinazas")
-st.markdown("Ajusta los parámetros operativos en el panel lateral para evaluar el comportamiento del intercambiador de calor W-210.")
+    # Definición de Equipos
+    P100 = bst.Pump("P100", ins=mosto, P=4 * 101325)
+    
+    W210 = bst.HXprocess("W210",
+                        ins=(P100-0, vinazas_retorno),
+                        outs=("3-Mosto-Pre", "Drenaje"),
+                        phase0="l", phase1="l")
+    W210.outs[0].T = 85 + 273.15
 
-# Panel lateral para inputs
-st.sidebar.header("Parámetros Operativos")
-flujo_m = st.sidebar.slider("Flujo de Mosto (kg/hr)", min_value=500.0, max_value=1500.0, value=1000.0, step=50.0)
-temp_m = st.sidebar.slider("Temperatura de Entrada (°C)", min_value=15.0, max_value=40.0, value=25.0, step=1.0)
-temp_salida = st.sidebar.slider("Temp. Objetivo Salida W-210 (°C)", min_value=70.0, max_value=95.0, value=85.0, step=1.0)
+    W220 = bst.HXutility("W220", ins=W210-0, outs="Mezcla", T=92 + 273.15)
+    
+    V100 = bst.IsenthalpicValve("V100", ins=W220-0, outs="Mezcla-Bifasica", P=101325)
 
-# Botón de ejecución
-if st.button("Ejecutar Simulación", type="primary"):
-    with st.spinner("Resolviendo balances de materia y energía..."):
-        # Llamar a la función de simulación
-        sistema, bomba, intercambiador = ejecutar_simulacion(flujo_m, temp_m, temp_salida)
-        
-        st.success("Simulación completada con éxito.")
-        
-        # --- Mostrar Resultados ---
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Resultados del Equipo")
-            # Extraer resultados manejando posibles errores de equipos sin duty
-            potencia_bomba = bomba.power_utility.rate if bomba.power_utility else 0.0
-            
-            resultados_df = pd.DataFrame({
-                "Variable": [
-                    "Carga Térmica W-210 (kW)", 
-                    "Temp. Real Salida Mosto (°C)",
-                    "Potencia Bomba P-100 (kW)"
-                ],
-                "Valor": [
-                    round(intercambiador.duty / 3600, 2), # Convertir kJ/hr a kW
-                    round(intercambiador.outs[0].T - 273.15, 2),
-                    round(potencia_bomba, 2)
-                ]
+    # Tanque Flash (P_flash de entrada es en kPa, BioSTEAM usa Pa)
+    V1 = bst.Flash("V1", ins=V100-0, outs=("Vapor-Caliente", "Vinazas"), 
+                   P=p_flash_kpa * 1000, Q=0)
+
+    W310 = bst.HXutility("W310", ins=V1-0, outs="Producto-Final", T=25 + 273.15)
+
+    P200 = bst.Pump("P200", ins=V1-1, outs=vinazas_retorno, P=3 * 101325)
+
+    # Sistema y Simulación
+    eth_sys = bst.System("planta_etanol", path=(P100, W210, W220, V100, V1, W310, P200))
+    
+    try:
+        eth_sys.simulate()
+        return eth_sys, None
+    except Exception as e:
+        return None, str(e)
+
+# =================================================================
+# 3. GENERACIÓN DE REPORTES (MANEJO DE ERRORES DE ENERGÍA)
+# =================================================================
+def generar_tablas(sistema):
+    # Tabla de Materia
+    datos_mat = []
+    for s in sistema.streams:
+        if s.F_mass > 0.01:
+            datos_mat.append({
+                "Corriente": s.ID,
+                "Temp (°C)": round(s.T - 273.15, 2),
+                "P (bar)": round(s.P / 1e5, 2),
+                "Flujo (kg/h)": round(s.F_mass, 2),
+                "% Etanol": f"{(s.imass['Ethanol']/s.F_mass if s.F_mass>0 else 0):.1%}"
             })
-            st.table(resultados_df)
-            
-            # Guardar en memoria de Streamlit para la IA
-            st.session_state['datos_simulacion'] = resultados_df.to_markdown()
+    df_m = pd.DataFrame(datos_mat)
 
-        with col2:
-            st.subheader("Diagrama de Flujo (PFD)")
-            
-            # Generar y mostrar el diagrama de forma segura
-            try:
-                # BioSTEAM usa graphviz, exportamos a png
-                sistema.diagram(kind='surface', format='png', file='pfd_temporal')
-                if os.path.exists('pfd_temporal.png'):
-                    st.image('pfd_temporal.png', use_container_width=True)
-            except Exception as e:
-                st.warning(f"No se pudo renderizar el diagrama visual. Verifica que Graphviz esté instalado en el entorno. Error: {e}")
-
-# ==========================================
-# 4. INTEGRACIÓN DE IA (TUTOR VIRTUAL)
-# ==========================================
-st.divider()
-st.header("🧠 Tutor de Ingeniería Química (IA)")
-
-if 'datos_simulacion' in st.session_state:
-    if st.button("Analizar resultados con el Tutor IA"):
-        try:
-            # Obtener la API Key de los secretos de Streamlit
-            api_key = st.secrets["GEMINI_API_KEY"]
-            genai.configure(api_key=api_key)
-            modelo = genai.GenerativeModel('gemini-1.5-pro')
-            
-            prompt = f"""
-            Actúa como un profesor experto en Ingeniería Química. 
-            A continuación, te presento los resultados de una simulación de calentamiento de mosto con vinazas:
-            
-            {st.session_state['datos_simulacion']}
-            
-            Analiza estos datos de forma concisa. Explica brevemente si la transferencia de calor tiene sentido termodinámico 
-            y dale al estudiante un consejo práctico sobre cómo optimizar este intercambiador de calor en una planta real.
-            """
-            
-            with st.spinner("El tutor está analizando los datos termodinámicos..."):
-                respuesta = modelo.generate_content(prompt)
-                st.info(respuesta.text)
-                
-        except KeyError:
-            st.error("Error: No se encontró la GEMINI_API_KEY en st.secrets. Asegúrate de configurarla en Streamlit Cloud.")
-        except Exception as e:
-            st.error(f"Error al conectar con la IA: {e}")
-else:
-    st.caption("Ejecuta la simulación primero para que la IA tenga datos que analizar.")
+    # Tabla de Energía (Uso de heat_utilities para evitar error .duty)
+    datos_en = []
+    for u in sistema.units:
+        # Recuperación de calor interna
+        if isinstance(u, bst.HXprocess):
+            calor = (u.outs[0].H - u.ins[0].H) / 3600
+            datos_en.append({"Equipo": u.ID, "Servicio": "Recuperación", "kW": round(calor, 2)})
+        
+        # Servicios auxiliares (Vapor/Agua)
+        elif hasattr(u, 'heat_utilities') and u.heat_utilities:
+            calor = sum(hu.duty for hu in u.heat_utilities) / 3600
+            tipo = "Calentamiento" if calor > 0 else "Enfriamiento"
+            dat
