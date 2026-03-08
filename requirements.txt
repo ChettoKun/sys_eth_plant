@@ -1,0 +1,4 @@
+streamlit
+biosteam
+google-generativeai
+pandas
